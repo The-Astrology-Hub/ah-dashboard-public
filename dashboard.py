@@ -28,12 +28,20 @@ def load_data():
     woo_df = woo_df.rename(columns={
         'billing_email': 'Email', 
         'date_created_gmt': 'Order Date', 
-        'total_amount': 'Order Total'
+        'total_amount': 'Order Total',
+        'order_type': 'Order Type',
+        'subscription_ids': 'Subscription IDs'
     })
-    woo_df = woo_df[['Email', 'Order Date', 'Order Total']].dropna(subset=['Email'])
+    if 'Order Type' not in woo_df.columns:
+        woo_df['Order Type'] = 'one_time'
+    if 'Subscription IDs' not in woo_df.columns:
+        woo_df['Subscription IDs'] = ''
+    woo_df = woo_df[['Email', 'Order Date', 'Order Total', 'Order Type', 'Subscription IDs']].dropna(subset=['Email'])
     woo_df['Email'] = woo_df['Email'].str.lower().str.strip()
     woo_df['Order Date'] = pd.to_datetime(woo_df['Order Date'], errors='coerce')
     woo_df['Order Total'] = pd.to_numeric(woo_df['Order Total'], errors='coerce').fillna(0)
+    woo_df['Order Type'] = woo_df['Order Type'].fillna('one_time')
+    woo_df['Subscription IDs'] = woo_df['Subscription IDs'].fillna('')
 
     # Calculate overlapping start date 
     ac_min_date = ac_df['Date Created'].min()
@@ -47,8 +55,16 @@ def load_data():
     # Calculate Sequential Order Data
     merged = merged.sort_values(['Email', 'Order Date'])
     merged['Order Sequence'] = merged.groupby('Email').cumcount() + 1
+    non_renewal_mask = merged['Order Type'] != 'subscription_renewal'
+    merged['Purchase Sequence'] = float('nan')
+    merged.loc[non_renewal_mask, 'Purchase Sequence'] = (
+        merged[non_renewal_mask].groupby('Email').cumcount() + 1
+    )
     merged['Days Since Subscription'] = (merged['Order Date'] - merged['Date Created']).dt.days
-    merged['Days Since Previous Order'] = merged.groupby('Email')['Order Date'].diff().dt.days
+    merged['Days Since Previous Order'] = float('nan')
+    merged.loc[non_renewal_mask, 'Days Since Previous Order'] = (
+        merged[non_renewal_mask].groupby('Email')['Order Date'].diff().dt.days
+    )
 
     return merged, valid_start_date
 
@@ -83,7 +99,7 @@ def format_pct(value):
 
 
 def build_customer_model(source_df):
-    first_orders = source_df[source_df['Order Sequence'] == 1][['Email', 'Order Date']]
+    first_orders = source_df[source_df['Purchase Sequence'] == 1][['Email', 'Order Date']]
     first_orders = first_orders.rename(columns={'Order Date': 'First Order Date'})
 
     customers = source_df.groupby('Email').agg(
@@ -98,7 +114,7 @@ def build_customer_model(source_df):
         repeat_window['Order Date'] - repeat_window['First Order Date']
     ).dt.days
     repeated_90 = repeat_window[
-        (repeat_window['Order Sequence'] > 1)
+        (repeat_window['Purchase Sequence'] > 1)
         & (repeat_window['Days After First Order'] <= 90)
     ]['Email'].unique()
 
@@ -108,42 +124,79 @@ def build_customer_model(source_df):
 # --- 3. CALCULATE METRICS ---
 if not filtered_df.empty:
     st.subheader(f"Metrics for {start_date} to {end_date}")
+
+    new_purchase_df = filtered_df[filtered_df['Order Type'] != 'subscription_renewal'].copy()
+    renewal_df = filtered_df[filtered_df['Order Type'] == 'subscription_renewal'].copy()
     
     total_revenue = filtered_df['Order Total'].sum()
     unique_buyers = filtered_df['Email'].nunique()
     total_orders = len(filtered_df)
     average_order_value = total_revenue / total_orders if total_orders > 0 else 0
+    new_purchase_revenue = new_purchase_df['Order Total'].sum()
+    new_purchase_orders = len(new_purchase_df)
+    new_purchase_aov = new_purchase_revenue / new_purchase_orders if new_purchase_orders > 0 else 0
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Revenue", f"${total_revenue:,.2f}")
     col2.metric("Unique Buyers", f"{unique_buyers:,}")
     col3.metric("Average Order Value", format_money(average_order_value))
-    col4.metric("Avg Orders per Buyer", f"{(total_orders / unique_buyers):.1f}" if unique_buyers > 0 else "0")
+    col4.metric("New Purchase AOV", format_money(new_purchase_aov))
 
     st.divider()
 
     # --- 4. FINANCIAL AND TRACKING MODELS ---
     st.subheader("Financial & Retention Models")
 
-    buyer_orders = filtered_df.groupby('Email')['Order Total'].agg(['sum', 'count'])
+    buyer_orders = new_purchase_df.groupby('Email')['Order Total'].agg(['sum', 'count'])
     repeat_buyers = (buyer_orders['count'] > 1).sum()
-    repeat_buyer_rate = repeat_buyers / unique_buyers if unique_buyers > 0 else 0
+    new_purchase_buyers = new_purchase_df['Email'].nunique()
+    repeat_buyer_rate = repeat_buyers / new_purchase_buyers if new_purchase_buyers > 0 else 0
     revenue_per_buyer = total_revenue / unique_buyers if unique_buyers > 0 else 0
-    returning_revenue = filtered_df[filtered_df['Order Sequence'] > 1]['Order Total'].sum()
-    returning_revenue_share = returning_revenue / total_revenue if total_revenue > 0 else 0
+    returning_revenue = new_purchase_df[new_purchase_df['Purchase Sequence'] > 1]['Order Total'].sum()
+    returning_revenue_share = returning_revenue / new_purchase_revenue if new_purchase_revenue > 0 else 0
 
     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
     f_col1.metric("Observed Revenue per Buyer", format_money(revenue_per_buyer))
     f_col2.metric("Repeat Buyer Rate", format_pct(repeat_buyer_rate))
-    f_col3.metric("Returning Revenue Share", format_pct(returning_revenue_share))
+    f_col3.metric("Non-Renewal Returning Revenue", format_pct(returning_revenue_share))
     f_col4.metric("Repeat Buyers", f"{repeat_buyers:,}")
+
+    order_type_summary = filtered_df.groupby('Order Type').agg(
+        Orders=('Order Total', 'size'),
+        Revenue=('Order Total', 'sum'),
+        Buyers=('Email', 'nunique')
+    ).reset_index()
+    order_type_summary['Revenue Share'] = order_type_summary['Revenue'] / total_revenue if total_revenue > 0 else 0
+    order_type_summary['Avg Transaction Value'] = order_type_summary['Revenue'] / order_type_summary['Orders']
+    order_type_summary = order_type_summary.sort_values('Revenue', ascending=False)
+    display_order_types = order_type_summary.copy()
+    display_order_types['Revenue'] = display_order_types['Revenue'].map(format_money)
+    display_order_types['Revenue Share'] = display_order_types['Revenue Share'].map(format_pct)
+    display_order_types['Avg Transaction Value'] = display_order_types['Avg Transaction Value'].map(format_money)
+
+    renewal_revenue = renewal_df['Order Total'].sum()
+    renewal_orders = len(renewal_df)
+    renewal_avg = renewal_revenue / renewal_orders if renewal_orders > 0 else 0
+    renewal_share = renewal_revenue / total_revenue if total_revenue > 0 else 0
+
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    s_col1.metric("Renewal Revenue", format_money(renewal_revenue))
+    s_col2.metric("Renewal Revenue Share", format_pct(renewal_share))
+    s_col3.metric("Renewal Orders", f"{renewal_orders:,}")
+    s_col4.metric("Avg Renewal Amount", format_money(renewal_avg))
 
     model_rows = [
         {
             "Model": "Average Order Value",
-            "Formula": "Revenue / Orders",
+            "Formula": "Revenue / All Transactions",
             "Current Value": format_money(average_order_value),
-            "Use": "Pricing, bundles, upsells, and offer quality"
+            "Use": "Blended transaction value, including subscription renewals"
+        },
+        {
+            "Model": "New Purchase AOV",
+            "Formula": "Non-Renewal Revenue / Non-Renewal Orders",
+            "Current Value": format_money(new_purchase_aov),
+            "Use": "Pricing, bundles, upsells, and offer quality excluding automatic renewals"
         },
         {
             "Model": "Observed Customer Value",
@@ -153,20 +206,24 @@ if not filtered_df.empty:
         },
         {
             "Model": "Repeat Purchase Rate",
-            "Formula": "Buyers with 2+ orders / Buyers",
+            "Formula": "Buyers with 2+ non-renewal orders / Non-renewal buyers",
             "Current Value": format_pct(repeat_buyer_rate),
-            "Use": "Retention strength and post-purchase follow-up"
+            "Use": "Retention strength excluding automatic subscription renewals"
         },
         {
             "Model": "Returning Revenue Share",
-            "Formula": "Revenue from order #2+ / Revenue",
+            "Formula": "Non-renewal revenue from purchase #2+ / Non-renewal revenue",
             "Current Value": format_pct(returning_revenue_share),
-            "Use": "How much revenue comes from repeat behavior"
+            "Use": "Repeat buying behavior without subscription renewal cadence"
         }
     ]
     st.dataframe(pd.DataFrame(model_rows), hide_index=True, width='stretch')
 
-    customers = build_customer_model(df)
+    st.markdown("##### Revenue by Order Type")
+    st.dataframe(display_order_types, hide_index=True, width='stretch')
+
+    customer_source = df[df['Order Type'] != 'subscription_renewal'].copy()
+    customers = build_customer_model(customer_source)
     cohort_customers = customers[
         (customers['First Order Date'].dt.date >= start_date)
         & (customers['First Order Date'].dt.date <= end_date)
@@ -204,7 +261,7 @@ if not filtered_df.empty:
     else:
         st.info("No first-order cohorts found in this selected date range.")
 
-    st.caption("These models use matched ActiveCampaign contacts and WooCommerce orders only. CAC, ROAS, and channel attribution need spend/source fields that are not currently in the dashboard data.")
+    st.caption("Revenue metrics include all matched WooCommerce transactions. Purchase behavior, repeat rate, and cohort metrics exclude subscription renewals so recurring billing does not inflate new-order behavior. CAC, ROAS, and channel attribution need spend/source fields that are not currently in the dashboard data.")
 
     st.divider()
 
@@ -215,7 +272,7 @@ if not filtered_df.empty:
     
     with v_col1:
         st.markdown("**Initial Conversion**")
-        first_orders = filtered_df[filtered_df['Order Sequence'] == 1]
+        first_orders = new_purchase_df[new_purchase_df['Purchase Sequence'] == 1]
         avg_days_to_first = first_orders['Days Since Subscription'].mean()
         avg_first_val = first_orders['Order Total'].mean()
         
@@ -226,7 +283,7 @@ if not filtered_df.empty:
         st.markdown("**Subsequent Purchases**")
         seq_data = []
         for seq in range(2, 6): 
-            seq_orders = filtered_df[filtered_df['Order Sequence'] == seq]
+            seq_orders = new_purchase_df[new_purchase_df['Purchase Sequence'] == seq]
             if not seq_orders.empty:
                 avg_gap = seq_orders['Days Since Previous Order'].mean()
                 avg_val = seq_orders['Order Total'].mean()
